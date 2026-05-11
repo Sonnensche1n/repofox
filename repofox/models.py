@@ -17,6 +17,7 @@ class FakeModelClient:
         self.outputs = list(outputs)
         self.prompts = []
         self.supports_prompt_cache = False
+        self.supports_streaming = False
         self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, **kwargs):
@@ -36,16 +37,18 @@ class OllamaModelClient:
         self.top_p = top_p
         self.timeout = timeout
         self.supports_prompt_cache = False
+        self.supports_streaming = True
         self.last_completion_metadata = {}
 
     def complete(self, prompt, max_new_tokens, **kwargs):
         # Ollama 当前不支持我们这里接入的 prompt cache 语义，
         # 所以 runtime 传下来的缓存参数会被忽略。
+        stream_handler = kwargs.pop("stream_handler", None)
         self.last_completion_metadata = {}
         payload = {
             "model": self.model,
             "prompt": prompt,
-            "stream": False,
+            "stream": bool(stream_handler),
             "raw": False,
             "think": False,
             "options": {
@@ -62,6 +65,26 @@ class OllamaModelClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                if stream_handler:
+                    # Ollama 的流式响应是一行一个 JSON 对象。这里一边把
+                    # response 增量推给上层，一边拼回完整文本，供现有
+                    # runtime parser、trace/report 链路继续使用。
+                    parts = []
+                    while True:
+                        line = response.readline()
+                        if not line:
+                            break
+                        line_text = line.decode("utf-8", errors="replace").strip()
+                        if not line_text:
+                            continue
+                        data = json.loads(line_text)
+                        if data.get("error"):
+                            raise RuntimeError(f"Ollama error: {data['error']}")
+                        chunk = data.get("response", "")
+                        if chunk:
+                            parts.append(chunk)
+                            stream_handler(chunk)
+                    return "".join(parts)
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -231,9 +254,10 @@ class OpenAICompatibleModelClient:
         # 当前只在明确支持 prompt cache 语义的后端上启用这条链路，
         # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
         self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes"))
+        self.supports_streaming = False
         self.last_completion_metadata = {}
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
+    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None, stream_handler=None):
         """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
 
         为什么存在：
@@ -247,10 +271,11 @@ class OpenAICompatibleModelClient:
           `self.last_completion_metadata`
 
         在 agent 链路里的位置：
-        它位于 `Pico.ask()` 的模型调用阶段，是稳定前缀缓存复用链路真正
+        它位于 `RepoFox.ask()` 的模型调用阶段，是稳定前缀缓存复用链路真正
         落到 provider API 的地方。
         """
         self.last_completion_metadata = {}
+        del stream_handler
         payload = {
             "model": self.model,
             "input": [
@@ -361,12 +386,13 @@ class AnthropicCompatibleModelClient:
         self.temperature = temperature
         self.timeout = timeout
         self.supports_prompt_cache = False
+        self.supports_streaming = False
         self.last_completion_metadata = {}
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
+    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None, stream_handler=None):
         # 为了保持统一接口，runtime 仍然会传缓存参数进来；
         # 这里只是显式丢弃，因为当前 Anthropic-compatible 路径没有接缓存复用。
-        del prompt_cache_key, prompt_cache_retention
+        del prompt_cache_key, prompt_cache_retention, stream_handler
         self.last_completion_metadata = {}
         payload = {
             "model": self.model,

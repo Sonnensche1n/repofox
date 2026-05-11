@@ -3,9 +3,9 @@ import shlex
 import sys
 from unittest.mock import patch
 
-from pico import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
-from pico import cli as mini_cli
-from pico.task_state import TaskState
+from repofox import FakeModelClient, RepoFoxAgent, SessionStore, WorkspaceContext
+from repofox import cli as repofox_cli
+from repofox.task_state import TaskState
 
 
 def build_workspace(tmp_path):
@@ -15,9 +15,9 @@ def build_workspace(tmp_path):
 
 def build_agent(tmp_path, outputs, **kwargs):
     workspace = build_workspace(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
+    store = SessionStore(tmp_path / ".repofox" / "sessions")
     approval_policy = kwargs.pop("approval_policy", "auto")
-    return MiniAgent(
+    return RepoFoxAgent(
         model_client=FakeModelClient(outputs),
         workspace=workspace,
         session_store=store,
@@ -65,10 +65,10 @@ def test_cli_build_agent_wires_secret_env_names_from_parser(tmp_path):
 
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
     with patch.dict(os.environ, {"GITHUB_PAT": "ghp-1", "GH_PAT": "ghp-2"}, clear=True), patch(
-        "pico.cli.OllamaModelClient",
+        "repofox.cli.OllamaModelClient",
         DummyModelClient,
     ):
-        args = mini_cli.build_arg_parser().parse_args(
+        args = repofox_cli.build_arg_parser().parse_args(
             [
                 "--cwd",
                 str(tmp_path),
@@ -80,7 +80,7 @@ def test_cli_build_agent_wires_secret_env_names_from_parser(tmp_path):
                 "GH_PAT",
             ]
         )
-        agent = mini_cli.build_agent(args)
+        agent = repofox_cli.build_agent(args)
         assert set(agent.secret_env_summary()["secret_env_names"]) == {"GITHUB_PAT", "GH_PAT"}
 
 
@@ -95,11 +95,11 @@ def test_cli_build_agent_uses_default_configured_secret_names(tmp_path):
 
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
     with patch.dict(os.environ, {"GH_PAT": "ghp-default-1"}, clear=True), patch(
-        "pico.cli.OllamaModelClient",
+        "repofox.cli.OllamaModelClient",
         DummyModelClient,
     ):
-        args = mini_cli.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--approval", "auto"])
-        agent = mini_cli.build_agent(args)
+        args = repofox_cli.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--approval", "auto"])
+        agent = repofox_cli.build_agent(args)
         assert agent.secret_env_summary()["secret_env_names"] == ["GH_PAT"]
 
 
@@ -120,9 +120,9 @@ def test_cli_build_agent_reads_secret_names_from_environment_config(tmp_path):
             "MINI_CODING_AGENT_SECRET_ENV_NAMES": "MCA_CUSTOM_SECRET",
         },
         clear=True,
-    ), patch("pico.cli.OllamaModelClient", DummyModelClient):
-        args = mini_cli.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--approval", "auto"])
-        agent = mini_cli.build_agent(args)
+    ), patch("repofox.cli.OllamaModelClient", DummyModelClient):
+        args = repofox_cli.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--approval", "auto"])
+        agent = repofox_cli.build_agent(args)
         assert agent.secret_env_summary()["secret_env_names"] == ["MCA_CUSTOM_SECRET"]
 
 
@@ -142,7 +142,7 @@ def test_run_shell_uses_allowlisted_environment_only(tmp_path):
 def test_bound_tool_methods_delegate_into_tools_module(tmp_path):
     agent = build_agent(tmp_path, [], approval_policy="auto")
 
-    with patch("pico.tools.subprocess.run") as fake_run:
+    with patch("repofox.tools.subprocess.run") as fake_run:
         fake_run.return_value = type(
             "Result",
             (),
@@ -152,9 +152,9 @@ def test_bound_tool_methods_delegate_into_tools_module(tmp_path):
 
     assert "toolkit-shell" in shell_result
     fake_run.assert_called_once()
-    assert agent.tool_run_shell.__func__.__module__ == "pico.runtime"
+    assert agent.tool_run_shell.__func__.__module__ == "repofox.runtime"
 
-    with patch("pico.tools.tool_delegate", return_value="toolkit-delegate") as fake_delegate:
+    with patch("repofox.tools.tool_delegate", return_value="toolkit-delegate") as fake_delegate:
         delegate_result = agent.tool_delegate({"task": "inspect README.md", "max_steps": 2})
 
     assert delegate_result == "toolkit-delegate"

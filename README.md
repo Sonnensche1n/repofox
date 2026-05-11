@@ -1,8 +1,10 @@
-# pico
+# RepoFox
 
-`pico` 是一个面向代码仓库的轻量本地 coding agent。它直接跑在终端里，先看当前工作区，再用一组受约束的工具去读文件、改文件、跑命令，并把会话状态保存在本地 `.pico/` 目录里。
+`RepoFox` 是一个面向代码仓库的轻量本地 coding agent。它直接跑在终端里，先看当前工作区，再用一组受约束的工具去读文件、改文件、跑命令，并把会话状态保存在本地 `.repofox/` 目录里。
 
 它更像一个能在仓库里持续工作的命令行助手，不是纯聊天窗口。你可以拿它做代码排查、测试修复、仓库分析，或者让它在当前项目里执行一次性的工程任务。
+
+除了终端交互，`RepoFox` 也可以用 `--serve` 启动为一个标准 Server-Sent Events（SSE）接口，把 agent 运行过程中的 thinking、tool_started、tool_finished、final_delta 等内部事件实时推给前端或其他编排系统。
 
 ## 适合做什么
 
@@ -10,14 +12,17 @@
 - 读取当前代码结构并给出修改建议
 - 基于现有文件做小步迭代，而不是脱离仓库空想
 - 在会话中保留上下文，支持继续上一次工作
+- 通过 SSE 事件流把 agent 执行过程接入 Web UI、TUI 或远程观测链路
 
 ## 主要特性
 
-- 包名是 `pico`
-- CLI 命令是 `pico`
-- 模块入口是 `python -m pico`
-- 会话保存在 `.pico/sessions/`
-- 每次运行的工件保存在 `.pico/runs/<run_id>/`
+- 包名是 `repofox`
+- CLI 命令是 `repofox`
+- 模块入口是 `python -m repofox`
+- 会话保存在 `.repofox/sessions/`
+- 每次运行的工件保存在 `.repofox/runs/<run_id>/`
+- 终端模式支持流式最终答案、`Thinking` 耗时状态、工具调用提示与工具耗时
+- `--serve` 模式提供标准 `text/event-stream` 输出，可订阅 `run_started`、`thinking`、`tool_started`、`tool_finished`、`final_delta`、`final_answer`、`done`、`error` 等事件
 - 支持三类模型后端：
   - Ollama
   - OpenAI 兼容 Responses API
@@ -27,15 +32,15 @@
 
 CLI 帮助信息：
 
-![pico help](assets/screenshots/pico-help.png)
+![repofox help](assets/screenshots/repofox-help.png)
 
 启动界面：
 
-![pico start](assets/screenshots/pico-start.png)
+![repofox start](assets/screenshots/repofox-start.png)
 
 REPL 内置命令与会话路径：
 
-![pico repl](assets/screenshots/pico-repl.png)
+![repofox repl](assets/screenshots/repofox-repl.png)
 
 ## 安装
 
@@ -58,25 +63,59 @@ pip install -e .
 在当前仓库里启动交互模式：
 
 ```bash
-uv run pico
+uv run repofox
 ```
 
 指定另一个工作目录：
 
 ```bash
-uv run pico --cwd /path/to/repo
+uv run repofox --cwd /path/to/repo
 ```
 
 直接跑一次性任务：
 
 ```bash
-uv run pico "inspect the test failures and propose a fix"
+uv run repofox "inspect the test failures and propose a fix"
+```
+
+启动标准 SSE 服务：
+
+```bash
+uv run repofox --provider ollama --model qwen2 --serve --serve-port 8765
+```
+
+请求一次 agent 任务：
+
+```bash
+curl -N \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"请分析这个仓库的测试结构"}' \
+  http://127.0.0.1:8765/ask
+```
+
+SSE 输出示例：
+
+```text
+event: run_started
+data: {"session_id":"...","workspace":"/path/to/repo"}
+
+event: thinking
+data: {"elapsed_ms":250,"frame":"/","status":"running"}
+
+event: tool_started
+data: {"args":{"path":"README.md"},"name":"read_file","summary":"path=README.md","tool_steps":1}
+
+event: final_delta
+data: {"text":"这个项目主要是..."}
+
+event: done
+data: {"status":"ok"}
 ```
 
 如果当前环境已经安装过包，也可以直接这样启动：
 
 ```bash
-python -m pico
+python -m repofox
 ```
 
 ## 模型后端
@@ -86,7 +125,7 @@ python -m pico
 ```bash
 ollama serve
 ollama pull qwen3.5:4b
-uv run pico --provider ollama --model qwen3.5:4b
+uv run repofox --provider ollama --model qwen3.5:4b
 ```
 
 ### OpenAI 兼容接口
@@ -95,7 +134,7 @@ uv run pico --provider ollama --model qwen3.5:4b
 export OPENAI_API_BASE="https://your-api.example/v1"
 export OPENAI_API_KEY="your-api-key"
 export OPENAI_MODEL="gpt-5.4"
-uv run pico --provider openai
+uv run repofox --provider openai
 ```
 
 ### Anthropic 兼容接口
@@ -104,10 +143,10 @@ uv run pico --provider openai
 export ANTHROPIC_API_BASE="https://www.right.codes/claude/v1"
 export ANTHROPIC_API_KEY="your-api-key"
 export ANTHROPIC_MODEL="claude-sonnet-4-6"
-uv run pico --provider anthropic
+uv run repofox --provider anthropic
 ```
 
-如果你的服务端对多个兼容接口复用了同一套密钥，`pico` 也支持从 `ANTHROPIC_API_KEY` 回退到 `RIGHT_CODES_API_KEY` 或 `OPENAI_API_KEY`。
+如果你的服务端对多个兼容接口复用了同一套密钥，`RepoFox` 也支持从 `ANTHROPIC_API_KEY` 回退到 `RIGHT_CODES_API_KEY` 或 `OPENAI_API_KEY`。
 
 ## 常用交互命令
 
@@ -119,13 +158,13 @@ uv run pico --provider anthropic
 
 ## 安全与持久化
 
-`pico` 不会默认把所有动作都放开。像 shell 执行、文件写入这类高风险操作，会受审批模式控制：
+`RepoFox` 不会默认把所有动作都放开。像 shell 执行、文件写入这类高风险操作，会受审批模式控制：
 
 - `--approval ask`
 - `--approval auto`
 - `--approval never`
 
-每次运行结束后，都会在 `.pico/runs/<run_id>/` 下写出这些文件：
+每次运行结束后，都会在 `.repofox/runs/<run_id>/` 下写出这些文件：
 
 - `task_state.json`
 - `trace.jsonl`

@@ -1,6 +1,6 @@
 """Agent 运行时核心逻辑。
 
-Pico 就是包在模型外面的控制循环：负责组 prompt、解析模型输出、
+RepoFox 就是包在模型外面的控制循环：负责组 prompt、解析模型输出、
 校验并执行工具、写 trace、更新工作记忆，以及在合适的时候停下来。
 """
 
@@ -63,6 +63,38 @@ class PromptPrefix:
     built_at: str
 
 
+class FinalAnswerStream:
+    """过滤模型原始流式片段，只把用户可见的最终答案往外推。"""
+
+    def __init__(self, callback):
+        self.callback = callback
+        self.buffer = ""
+        self.emitted_chars = 0
+
+    def feed(self, chunk):
+        if not chunk:
+            return
+        self.buffer += str(chunk)
+        visible = self.visible_text()
+        if len(visible) <= self.emitted_chars:
+            return
+        self.callback(visible[self.emitted_chars:])
+        self.emitted_chars = len(visible)
+
+    def visible_text(self):
+        # 工具调用是 runtime 内部控制消息，不能直接暴露给 CLI/SSE。
+        # 等模型进入 <final> 后，再把最终答案内容流式推给用户侧。
+        if "<final>" in self.buffer:
+            body = self.buffer.split("<final>", 1)[1]
+            if "</final>" in body:
+                return body.split("</final>", 1)[0]
+            return body
+        stripped = self.buffer.lstrip()
+        if stripped and not stripped.startswith("<"):
+            return self.buffer
+        return ""
+
+
 class SessionStore:
     def __init__(self, root):
         self.root = Path(root)
@@ -84,7 +116,7 @@ class SessionStore:
         return files[-1].stem if files else None
 
 
-class Pico:
+class RepoFox:
     def __init__(
         self,
         model_client,
@@ -117,7 +149,7 @@ class Pico:
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
-        self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
+        self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".repofox" / "runs")
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -341,7 +373,7 @@ class Pico:
         # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
         text = textwrap.dedent(
             f"""\
-            You are pico, a small local coding agent working inside a local repository.
+            You are repofox, a small local coding agent working inside a local repository.
 
             Rules:
             - Use tools instead of guessing about the workspace.
@@ -753,7 +785,7 @@ class Pico:
         self.last_durable_superseded = superseded
         return promoted, rejections, superseded
 
-    def ask(self, user_message):
+    def ask(self, user_message, stream_final=None, status_update=None):
         """执行一次完整的 agent 回合，直到产出最终答案或命中停止条件。
 
         为什么存在：
@@ -770,7 +802,7 @@ class Pico:
         它是 CLI 和底层工具/模型之间的核心桥梁。CLI 收到用户输入后基本只做
         一件事：调用 `agent.ask()`。而 `ask()` 内部再去驱动 `ContextManager`
         组 prompt、`model_client.complete()` 调模型、`run_tool()` 执行动作。
-        如果新人想理解 pico 是怎么“从一句话跑成一个 agent 流程”的，
+        如果新人想理解 repofox 是怎么“从一句话跑成一个 agent 流程”的，
         这里就是最关键的入口。
         """
         run_started_at = time.monotonic()
@@ -863,18 +895,32 @@ class Pico:
                     "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
                 },
             )
+            if status_update:
+                status_update(
+                    {
+                        "event": "thinking",
+                        "attempt": task_state.attempts,
+                        "tool_steps": task_state.tool_steps,
+                    }
+                )
             prompt_cache_key = None
             prompt_cache_retention = None
             if getattr(self.model_client, "supports_prompt_cache", False):
                 # 只有后端明确支持时，才把稳定前缀的 hash 作为 cache key 发出去。
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
+            stream_handler = None
+            if stream_final and getattr(self.model_client, "supports_streaming", False):
+                # 保持原有 parser 逻辑不变：仍然收集完整 raw response，
+                # 同时在 chunk 到达时只推送用户可见的最终答案。
+                stream_handler = FinalAnswerStream(stream_final).feed
             model_started_at = time.monotonic()
             raw = self.model_client.complete(
                 prompt,
                 self.max_new_tokens,
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
+                stream_handler=stream_handler,
             )
             completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
             if completion_metadata:
@@ -899,6 +945,15 @@ class Pico:
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 task_state.record_tool(name)
+                if status_update:
+                    status_update(
+                        {
+                            "event": "tool_started",
+                            "name": name,
+                            "args": dict(args),
+                            "tool_steps": task_state.tool_steps,
+                        }
+                    )
                 tool_started_at = time.monotonic()
                 result = self.run_tool(name, args)
                 self.record(
@@ -922,6 +977,15 @@ class Pico:
                         **dict(self._last_tool_result_metadata or {}),
                     },
                 )
+                if status_update:
+                    status_update(
+                        {
+                            "event": "tool_finished",
+                            "name": name,
+                            "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
+                            **dict(self._last_tool_result_metadata or {}),
+                        }
+                    )
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(
@@ -1230,35 +1294,35 @@ class Pico:
         # 1. <tool>...</tool> 里包 JSON，适合简短调用
         # 2. XML 风格属性/子标签，适合写文件这类多行内容
         if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
-            body = Pico.extract(raw, "tool")
+            body = RepoFox.extract(raw, "tool")
             try:
                 payload = json.loads(body)
             except Exception:
-                return "retry", Pico.retry_notice("model returned malformed tool JSON")
+                return "retry", RepoFox.retry_notice("model returned malformed tool JSON")
             if not isinstance(payload, dict):
-                return "retry", Pico.retry_notice("tool payload must be a JSON object")
+                return "retry", RepoFox.retry_notice("tool payload must be a JSON object")
             if not str(payload.get("name", "")).strip():
-                return "retry", Pico.retry_notice("tool payload is missing a tool name")
+                return "retry", RepoFox.retry_notice("tool payload is missing a tool name")
             args = payload.get("args", {})
             if args is None:
                 payload["args"] = {}
             elif not isinstance(args, dict):
-                return "retry", Pico.retry_notice()
+                return "retry", RepoFox.retry_notice()
             return "tool", payload
         if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
-            payload = Pico.parse_xml_tool(raw)
+            payload = RepoFox.parse_xml_tool(raw)
             if payload is not None:
                 return "tool", payload
-            return "retry", Pico.retry_notice()
+            return "retry", RepoFox.retry_notice()
         if "<final>" in raw:
-            final = Pico.extract(raw, "final").strip()
+            final = RepoFox.extract(raw, "final").strip()
             if final:
                 return "final", final
-            return "retry", Pico.retry_notice("model returned an empty <final> answer")
+            return "retry", RepoFox.retry_notice("model returned an empty <final> answer")
         raw = raw.strip()
         if raw:
             return "final", raw
-        return "retry", Pico.retry_notice("model returned an empty response")
+        return "retry", RepoFox.retry_notice("model returned an empty response")
 
     @staticmethod
     def retry_notice(problem=None):
@@ -1277,7 +1341,7 @@ class Pico:
         match = re.search(r"<tool(?P<attrs>[^>]*)>(?P<body>.*?)</tool>", raw, re.S)
         if not match:
             return None
-        attrs = Pico.parse_attrs(match.group("attrs"))
+        attrs = RepoFox.parse_attrs(match.group("attrs"))
         name = str(attrs.pop("name", "")).strip()
         if not name:
             return None
@@ -1286,7 +1350,7 @@ class Pico:
         args = dict(attrs)
         for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path"):
             if f"<{key}>" in body:
-                args[key] = Pico.extract_raw(body, key)
+                args[key] = RepoFox.extract_raw(body, key)
 
         body_text = body.strip("\n")
         if name == "write_file" and "content" not in args and body_text:
@@ -1346,4 +1410,4 @@ class Pico:
         return resolved
 
 
-MiniAgent = Pico
+RepoFoxAgent = RepoFox

@@ -265,9 +265,9 @@ def tool_delegate(agent, args):
     if not task:
         raise ValueError("task must not be empty")
 
-    from .runtime import Pico
+    from .runtime import RepoFox
 
-    child = Pico(
+    child = RepoFox(
         model_client=agent.model_client,
         workspace=agent.workspace,
         session_store=agent.session_store,
