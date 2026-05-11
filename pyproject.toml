@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repofox"
+version = "0.1.0"
+description = "RepoFox local coding agent CLI for Ollama and OpenAI-compatible models"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+repofox = "repofox.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.5",
+  "ruff>=0.4.4",
+]
+
+[tool.setuptools]
+packages = ["repofox"]
