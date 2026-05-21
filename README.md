@@ -32,15 +32,11 @@
 
 CLI 帮助信息：
 
-![repofox help](assets/screenshots/repofox-help.png)
+![repofox help](assets/screenshots/help.png)
 
 启动界面：
 
-![repofox start](assets/screenshots/repofox-start.png)
-
-REPL 内置命令与会话路径：
-
-![repofox repl](assets/screenshots/repofox-repl.png)
+![repofox start](assets/screenshots/start.png)
 
 ## 安装
 
