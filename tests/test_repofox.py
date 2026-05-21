@@ -922,6 +922,18 @@ def test_build_arg_parser_accepts_sse_serve_mode(tmp_path):
     assert args.serve_port == 9999
 
 
+def test_maybe_enable_line_editing_imports_readline_when_available():
+    with patch("repofox.cli.importlib.import_module") as mock_import_module:
+        assert repofox_cli._maybe_enable_line_editing() is True
+
+    mock_import_module.assert_called_once_with("readline")
+
+
+def test_maybe_enable_line_editing_returns_false_when_readline_is_unavailable():
+    with patch("repofox.cli.importlib.import_module", side_effect=ImportError("missing")):
+        assert repofox_cli._maybe_enable_line_editing() is False
+
+
 def test_build_agent_uses_anthropic_provider_and_openai_key_fallback(tmp_path):
     args = type(
         "Args",
@@ -1177,6 +1189,23 @@ def test_final_answer_stream_ignores_trailing_final_close_tag_without_open_tag()
     assert "".join(streamed) == "pong"
 
 
+def test_final_answer_stream_ignores_partial_trailing_final_close_tag():
+    streamed = []
+    stream = repofox_runtime.FinalAnswerStream(streamed.append)
+
+    stream.feed("pong")
+    stream.feed("</final")
+
+    assert "".join(streamed) == "pong"
+
+
+def test_parse_strips_trailing_final_close_tag_fragment_without_open_tag():
+    kind, payload = repofox_pkg.RepoFox.parse("pong</final")
+
+    assert kind == "final"
+    assert payload == "pong"
+
+
 def test_agent_emits_status_updates_for_model_and_tool_steps(tmp_path):
     (tmp_path / "hello.txt").write_text("alpha\nbeta\n", encoding="utf-8")
     agent = build_agent(
@@ -1212,6 +1241,7 @@ def test_status_printer_renders_human_readable_lines():
     printer.close()
 
     output = buffer.getvalue()
+    assert "\x1b[2K" in output
     assert "Thinking | 0.0s" in output
     assert "Running tool: read_file path=README.md start=1" in output
     assert "Tool finished: read_file (42ms)" in output

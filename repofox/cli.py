@@ -6,6 +6,7 @@
 """
 
 import argparse
+import importlib
 import json
 import os
 import shutil
@@ -70,6 +71,7 @@ THINKING_FRAMES = ("|", "/", "-", "\\")
 # CLI/SSE 状态事件只展示这些安全参数。`command`、`content` 等字段可能
 # 包含敏感信息，所以不会出现在状态提示和 SSE 事件里。
 SAFE_TOOL_ARG_KEYS = ("path", "pattern", "query", "start", "end")
+ANSI_CLEAR_LINE = "\r\x1b[2K"
 
 
 def _thinking_label(elapsed_seconds, frame="|"):
@@ -121,6 +123,16 @@ def _env_get(name, default=None):
     if name in _DOTENV_VALUES:
         return _DOTENV_VALUES[name]
     return default
+
+
+def _maybe_enable_line_editing():
+    # 显式加载 readline/libedit，避免某些 IDE PTY 在 `input()` 下退格
+    # 多字节字符时退回到逐字节擦除的行为。
+    try:
+        importlib.import_module("readline")
+        return True
+    except Exception:
+        return False
 
 
 def _clip_status_text(text, limit=60):
@@ -403,14 +415,13 @@ class ConsoleUI:
     def _render_status(self, text):
         # 用回车符原地刷新同一行状态。日志里可能看到多个 \r，
         # 但交互式终端里会显示为一条实时更新的状态行。
-        padded = text.ljust(self.status_width)
         self.status_width = max(self.status_width, len(text))
-        print("\r" + padded, end="", file=self.fileobj, flush=True)
+        print(ANSI_CLEAR_LINE + str(text), end="", file=self.fileobj, flush=True)
 
     def _clear_status_locked(self):
         if self.status_width <= 0:
             return
-        print("\r" + (" " * self.status_width) + "\r", end="", file=self.fileobj, flush=True)
+        print(ANSI_CLEAR_LINE, end="", file=self.fileobj, flush=True)
         self.status_width = 0
 
     def _thinking_loop(self, stop_event):
@@ -768,6 +779,7 @@ def build_arg_parser():
 
 
 def main(argv=None):
+    _maybe_enable_line_editing()
     args = build_arg_parser().parse_args(argv)
     agent = build_agent(args)
 
