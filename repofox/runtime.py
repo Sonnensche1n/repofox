@@ -89,6 +89,8 @@ class FinalAnswerStream:
             if "</final>" in body:
                 return body.split("</final>", 1)[0]
             return body
+        if "</final>" in self.buffer:
+            return self.buffer.split("</final>", 1)[0]
         stripped = self.buffer.lstrip()
         if stripped and not stripped.startswith("<"):
             return self.buffer

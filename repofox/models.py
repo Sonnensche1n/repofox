@@ -109,6 +109,22 @@ def _normalize_versioned_base_url(base_url):
     return base
 
 
+def _extract_text_content(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+        if parts:
+            return "".join(parts)
+    return ""
+
+
 def _extract_openai_text(data):
     if data.get("output_text"):
         return data["output_text"]
@@ -123,15 +139,9 @@ def _extract_openai_text(data):
     choices = data.get("choices", [])
     if choices:
         message = choices[0].get("message", {})
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict):
-                    text = item.get("text")
-                    if text:
-                        return text
+        text = _extract_text_content(message.get("content"))
+        if text:
+            return text
 
     return ""
 
@@ -241,6 +251,52 @@ def _extract_usage_cache_details(data):
         "total_tokens": usage.get("total_tokens"),
         "cached_tokens": cached_tokens,
         "cache_hit": cached_tokens > 0,
+    }
+
+
+def _extract_deepseek_text(data):
+    choices = data.get("choices", [])
+    if not choices:
+        return ""
+    choice = choices[0]
+    message = choice.get("message", {})
+    text = _extract_text_content(message.get("content"))
+    if text:
+        return text
+    delta = choice.get("delta", {})
+    text = _extract_text_content(delta.get("content"))
+    if text:
+        return text
+    return ""
+
+
+def _extract_deepseek_delta_text(data):
+    choices = data.get("choices", [])
+    if not choices:
+        return ""
+    choice = choices[0]
+    delta = choice.get("delta", {})
+    return _extract_text_content(delta.get("content"))
+
+
+def _extract_deepseek_usage_details(data):
+    usage = data.get("usage") or {}
+    cached_tokens = int(
+        usage.get("prompt_cache_hit_tokens")
+        or (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        or 0
+    )
+    reasoning_tokens = (
+        (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        or usage.get("reasoning_tokens")
+    )
+    return {
+        "input_tokens": usage.get("prompt_tokens"),
+        "output_tokens": usage.get("completion_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+        "cached_tokens": cached_tokens,
+        "cache_hit": cached_tokens > 0,
+        "reasoning_tokens": reasoning_tokens,
     }
 
 
@@ -367,6 +423,121 @@ class OpenAICompatibleModelClient:
             **_extract_usage_cache_details(data),
         }
         return _extract_openai_text(data)
+
+
+class DeepSeekModelClient:
+    def __init__(self, model, base_url, api_key, temperature, timeout, thinking="enabled", reasoning_effort="high"):
+        self.model = model
+        self.base_url = _normalize_versioned_base_url(base_url)
+        self.api_key = api_key
+        self.temperature = temperature
+        self.timeout = timeout
+        self.thinking = thinking
+        self.reasoning_effort = reasoning_effort
+        self.supports_prompt_cache = False
+        self.supports_streaming = True
+        self.last_completion_metadata = {}
+
+    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None, stream_handler=None):
+        del prompt_cache_key, prompt_cache_retention
+        self.last_completion_metadata = {}
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            "max_tokens": max_new_tokens,
+            "stream": bool(stream_handler),
+            "thinking": {
+                "type": self.thinking,
+            },
+        }
+        if self.thinking != "disabled" and self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        request = urllib.request.Request(
+            self.base_url + "/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    if stream_handler:
+                        parts = []
+                        usage_data = {}
+                        while True:
+                            line = response.readline()
+                            if not line:
+                                break
+                            line_text = line.decode("utf-8", errors="replace").strip()
+                            if not line_text or not line_text.startswith("data:"):
+                                continue
+                            payload_text = line_text[len("data:"):].strip()
+                            if not payload_text or payload_text == "[DONE]":
+                                continue
+                            try:
+                                data = json.loads(payload_text)
+                            except json.JSONDecodeError:
+                                continue
+                            if data.get("error"):
+                                raise RuntimeError(f"DeepSeek error: {data['error']}")
+                            delta_text = _extract_deepseek_delta_text(data)
+                            if delta_text:
+                                parts.append(delta_text)
+                                stream_handler(delta_text)
+                            if data.get("usage"):
+                                usage_data = data
+                        self.last_completion_metadata = {
+                            "prompt_cache_supported": self.supports_prompt_cache,
+                            **_extract_deepseek_usage_details(usage_data),
+                        }
+                        return "".join(parts)
+                    body_text = response.read().decode("utf-8")
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code >= 500 and attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"DeepSeek request failed with HTTP {exc.code}: {body}") from exc
+            except (urllib.error.URLError, RemoteDisconnected) as exc:
+                if attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(
+                    "Could not reach the DeepSeek backend.\n"
+                    f"Base URL: {self.base_url}\n"
+                    f"Model: {self.model}"
+                ) from exc
+
+        try:
+            data = json.loads(body_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "DeepSeek error: backend returned non-JSON content that could not be parsed"
+            ) from exc
+        if data.get("error"):
+            raise RuntimeError(f"DeepSeek error: {data['error']}")
+        self.last_completion_metadata = {
+            "prompt_cache_supported": self.supports_prompt_cache,
+            **_extract_deepseek_usage_details(data),
+        }
+        text = _extract_deepseek_text(data)
+        if text:
+            return text
+        raise RuntimeError("DeepSeek error: could not extract text from response")
 
 
 def _extract_anthropic_text(data):

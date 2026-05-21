@@ -9,6 +9,10 @@ __pycache__/
 venv/
 uv.lock
 
+# Local environment files
+.env
+.env.local
+
 # Packaging
 *.egg-info/
 build/

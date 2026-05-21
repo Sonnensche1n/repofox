@@ -8,8 +8,10 @@ from unittest.mock import patch
 
 import repofox as repofox_pkg
 import repofox.cli as repofox_cli
+import repofox.runtime as repofox_runtime
 from repofox import (
     AnthropicCompatibleModelClient,
+    DeepSeekModelClient,
     FakeModelClient,
     RepoFoxAgent,
     OllamaModelClient,
@@ -667,6 +669,166 @@ def test_anthropic_compatible_client_extracts_first_text_block():
     assert result == "<final>ok</final>"
 
 
+def test_deepseek_client_posts_expected_chat_completions_payload():
+    captured = {}
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "<final>ok</final>",
+                            }
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 128,
+                        "completion_tokens": 16,
+                        "total_tokens": 144,
+                    },
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        captured["headers"] = dict(request.headers)
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    client = DeepSeekModelClient(
+        model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com",
+        api_key="sk-deepseek",
+        temperature=0.6,
+        timeout=30,
+        thinking="enabled",
+        reasoning_effort="max",
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = client.complete("hello", 42)
+
+    assert result == "<final>ok</final>"
+    assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert captured["timeout"] == 30
+    assert captured["headers"]["Authorization"] == "Bearer sk-deepseek"
+    assert captured["body"] == {
+        "model": "deepseek-v4-pro",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 42,
+        "stream": False,
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+        "temperature": 0.6,
+    }
+    assert client.last_completion_metadata["input_tokens"] == 128
+    assert client.last_completion_metadata["output_tokens"] == 16
+    assert client.last_completion_metadata["total_tokens"] == 144
+
+
+def test_deepseek_client_omits_reasoning_effort_when_thinking_disabled():
+    captured = {}
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "<final>ok</final>",
+                            }
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    client = DeepSeekModelClient(
+        model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com",
+        api_key="sk-deepseek",
+        temperature=0.6,
+        timeout=30,
+        thinking="disabled",
+        reasoning_effort="high",
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = client.complete("hello", 42)
+
+    assert result == "<final>ok</final>"
+    assert captured["body"]["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in captured["body"]
+
+
+def test_deepseek_client_extracts_text_from_event_stream():
+    class FakeResponse:
+        headers = {"Content-Type": "text/event-stream"}
+
+        def __init__(self):
+            self._lines = [
+                'data: {"choices":[{"delta":{"content":"<final>"}}]}\n'.encode("utf-8"),
+                'data: {"choices":[{"delta":{"content":"stream ok"}}]}\n'.encode("utf-8"),
+                'data: {"choices":[{"delta":{"content":"</final>"}}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}\n'.encode("utf-8"),
+                "data: [DONE]\n".encode("utf-8"),
+            ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def readline(self):
+            if self._lines:
+                return self._lines.pop(0)
+            return b""
+
+    streamed = []
+    client = DeepSeekModelClient(
+        model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com",
+        api_key="sk-deepseek",
+        temperature=0.2,
+        timeout=30,
+        thinking="enabled",
+        reasoning_effort="high",
+    )
+
+    with patch("urllib.request.urlopen", return_value=FakeResponse()):
+        result = client.complete("hello", 42, stream_handler=streamed.append)
+
+    assert result == "<final>stream ok</final>"
+    assert streamed == ["<final>", "stream ok", "</final>"]
+    assert client.last_completion_metadata["input_tokens"] == 10
+    assert client.last_completion_metadata["output_tokens"] == 3
+    assert client.last_completion_metadata["total_tokens"] == 13
+
+
 def test_build_agent_uses_openai_provider_and_model_override(tmp_path):
     args = type(
         "Args",
@@ -721,6 +883,25 @@ def test_build_arg_parser_accepts_anthropic_provider(tmp_path):
     args = repofox_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "anthropic"])
 
     assert args.provider == "anthropic"
+
+
+def test_build_arg_parser_accepts_deepseek_provider_and_options(tmp_path):
+    args = repofox_pkg.build_arg_parser().parse_args(
+        [
+            "--cwd",
+            str(tmp_path),
+            "--provider",
+            "deepseek",
+            "--deepseek-thinking",
+            "disabled",
+            "--deepseek-reasoning-effort",
+            "max",
+        ]
+    )
+
+    assert args.provider == "deepseek"
+    assert args.deepseek_thinking == "disabled"
+    assert args.deepseek_reasoning_effort == "max"
 
 
 def test_build_arg_parser_accepts_sse_serve_mode(tmp_path):
@@ -802,6 +983,42 @@ def test_build_agent_uses_anthropic_default_model_when_env_is_missing(tmp_path):
     assert mock_anthropic.call_args.kwargs["model"] == "claude-sonnet-4-6"
 
 
+def test_build_agent_uses_deepseek_provider_and_env_defaults(tmp_path):
+    args = repofox_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "deepseek"])
+
+    with patch.dict(
+        os.environ,
+        {
+            "DEEPSEEK_API_BASE": "https://api.deepseek.com",
+            "DEEPSEEK_API_KEY": "sk-deepseek",
+            "DEEPSEEK_MODEL": "deepseek-v4-flash",
+            "DEEPSEEK_THINKING": "disabled",
+            "DEEPSEEK_REASONING_EFFORT": "max",
+        },
+        clear=False,
+    ):
+        with patch(
+            "repofox.cli.OllamaModelClient",
+            side_effect=AssertionError("ollama client should not be used"),
+        ), patch(
+            "repofox.cli.OpenAICompatibleModelClient",
+            side_effect=AssertionError("openai client should not be used"),
+        ), patch(
+            "repofox.cli.AnthropicCompatibleModelClient",
+            side_effect=AssertionError("anthropic client should not be used"),
+        ), patch("repofox.cli.DeepSeekModelClient") as mock_deepseek:
+            fake_client = mock_deepseek.return_value
+            agent = repofox_pkg.build_agent(args)
+
+    mock_deepseek.assert_called_once()
+    assert mock_deepseek.call_args.kwargs["model"] == "deepseek-v4-flash"
+    assert mock_deepseek.call_args.kwargs["base_url"] == "https://api.deepseek.com"
+    assert mock_deepseek.call_args.kwargs["api_key"] == "sk-deepseek"
+    assert mock_deepseek.call_args.kwargs["thinking"] == "disabled"
+    assert mock_deepseek.call_args.kwargs["reasoning_effort"] == "max"
+    assert agent.model_client is fake_client
+
+
 def test_build_agent_uses_openai_provider_by_default(tmp_path):
     args = repofox_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
 
@@ -825,6 +1042,52 @@ def test_build_agent_uses_openai_provider_by_default(tmp_path):
     assert mock_openai.call_args.kwargs["base_url"] == "https://www.right.codes/codex/v1"
     assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
     assert agent.model_client is fake_client
+
+
+def test_build_agent_loads_dotenv_for_deepseek_provider(tmp_path):
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "DEEPSEEK_API_KEY=sk-from-dotenv",
+                "DEEPSEEK_API_BASE=https://api.deepseek.com",
+                "DEEPSEEK_MODEL=deepseek-v4-flash",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    args = repofox_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "deepseek"])
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("repofox.cli.DeepSeekModelClient") as mock_deepseek:
+            repofox_pkg.build_agent(args)
+
+    assert mock_deepseek.call_args.kwargs["api_key"] == "sk-from-dotenv"
+    assert mock_deepseek.call_args.kwargs["base_url"] == "https://api.deepseek.com"
+    assert mock_deepseek.call_args.kwargs["model"] == "deepseek-v4-flash"
+
+
+def test_build_agent_prefers_dotenv_local_over_dotenv(tmp_path):
+    (tmp_path / ".env").write_text("DEEPSEEK_MODEL=deepseek-v4-flash\n", encoding="utf-8")
+    (tmp_path / ".env.local").write_text("DEEPSEEK_MODEL=deepseek-v4-pro\n", encoding="utf-8")
+    args = repofox_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "deepseek"])
+
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("repofox.cli.DeepSeekModelClient") as mock_deepseek:
+            repofox_pkg.build_agent(args)
+
+    assert mock_deepseek.call_args.kwargs["model"] == "deepseek-v4-pro"
+
+
+def test_build_agent_prefers_process_env_over_dotenv(tmp_path):
+    (tmp_path / ".env").write_text("DEEPSEEK_MODEL=deepseek-v4-flash\n", encoding="utf-8")
+    args = repofox_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "deepseek"])
+
+    with patch.dict(os.environ, {"DEEPSEEK_MODEL": "deepseek-v4-pro"}, clear=True):
+        with patch("repofox.cli.DeepSeekModelClient") as mock_deepseek:
+            repofox_pkg.build_agent(args)
+
+    assert mock_deepseek.call_args.kwargs["model"] == "deepseek-v4-pro"
 
 
 def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
@@ -902,6 +1165,16 @@ def test_agent_streams_only_final_answer_content(tmp_path):
 
     assert answer == "Done streaming."
     assert "".join(streamed) == "Done streaming."
+
+
+def test_final_answer_stream_ignores_trailing_final_close_tag_without_open_tag():
+    streamed = []
+    stream = repofox_runtime.FinalAnswerStream(streamed.append)
+
+    stream.feed("pong")
+    stream.feed("</final>")
+
+    assert "".join(streamed) == "pong"
 
 
 def test_agent_emits_status_updates_for_model_and_tool_steps(tmp_path):

@@ -14,15 +14,17 @@ import textwrap
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
+from .models import AnthropicCompatibleModelClient, DeepSeekModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import RepoFox, SessionStore
 from .workspace import WorkspaceContext, middle
 
 DEFAULT_SECRET_ENV_NAMES = (
     "OPENAI_API_KEY",
     "OPENAI_API_TOKEN",
+    "DEEPSEEK_API_KEY",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "RIGHT_CODES_API_KEY",
@@ -55,10 +57,13 @@ DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_OPENAI_MODEL = "gpt-5.4"
 DEFAULT_OPENAI_BASE_URL = "https://www.right.codes/codex/v1"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
 DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
 SECRET_ENV_NAMES_VAR = "REPOFOX_SECRET_ENV_NAMES"
+_DOTENV_VALUES = {}
 
 
 THINKING_FRAMES = ("|", "/", "-", "\\")
@@ -69,6 +74,53 @@ SAFE_TOOL_ARG_KEYS = ("path", "pattern", "query", "start", "end")
 
 def _thinking_label(elapsed_seconds, frame="|"):
     return f"Thinking {frame} {elapsed_seconds:.1f}s"
+
+
+def _parse_dotenv_line(line):
+    text = str(line).strip()
+    if not text or text.startswith("#"):
+        return None, None
+    if text.startswith("export "):
+        text = text[len("export "):].lstrip()
+    if "=" not in text:
+        return None, None
+    key, value = text.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None, None
+    value = value.strip()
+    if value and value[0] in ("'", '"') and value[-1:] == value[0]:
+        quote = value[0]
+        value = value[1:-1]
+        if quote == '"':
+            value = bytes(value, "utf-8").decode("unicode_escape")
+    else:
+        value = value.split(" #", 1)[0].rstrip()
+    return key, value
+
+
+def _load_dotenv_files(repo_root):
+    global _DOTENV_VALUES
+    root = Path(repo_root)
+    candidates = [root / ".env", root / ".env.local"]
+    loaded = {}
+    for path in candidates:
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, value = _parse_dotenv_line(line)
+            if key:
+                loaded[key] = value
+    _DOTENV_VALUES = loaded
+
+
+def _env_get(name, default=None):
+    value = os.environ.get(name)
+    if value:
+        return value
+    if name in _DOTENV_VALUES:
+        return _DOTENV_VALUES[name]
+    return default
 
 
 def _clip_status_text(text, limit=60):
@@ -475,12 +527,17 @@ def _effective_model(args, provider):
     if explicit_model:
         return explicit_model
     if provider == "openai":
-        model = os.environ.get("OPENAI_MODEL")
+        model = _env_get("OPENAI_MODEL")
         if model:
             return model
         return DEFAULT_OPENAI_MODEL
+    if provider == "deepseek":
+        model = _env_get("DEEPSEEK_MODEL")
+        if model:
+            return model
+        return DEFAULT_DEEPSEEK_MODEL
     if provider == "anthropic":
-        model = os.environ.get("ANTHROPIC_MODEL")
+        model = _env_get("ANTHROPIC_MODEL")
         if model:
             return model
         return DEFAULT_ANTHROPIC_MODEL
@@ -489,7 +546,7 @@ def _effective_model(args, provider):
 
 def _first_env(*names):
     for name in names:
-        value = os.environ.get(name)
+        value = _env_get(name)
         if value:
             return value
     return ""
@@ -498,9 +555,9 @@ def _first_env(*names):
 def _configured_secret_names(args):
     configured_secret_names = set(DEFAULT_SECRET_ENV_NAMES)
     configured_secret_names.update(str(name).upper() for name in args.secret_env_names)
-    extra_names = os.environ.get(SECRET_ENV_NAMES_VAR, "")
+    extra_names = _env_get(SECRET_ENV_NAMES_VAR, "")
     if not extra_names.strip():
-        extra_names = os.environ.get(LEGACY_SECRET_ENV_NAMES_VAR, "")
+        extra_names = _env_get(LEGACY_SECRET_ENV_NAMES_VAR, "")
     if extra_names.strip():
         configured_secret_names.update(
             item.strip().upper()
@@ -516,8 +573,8 @@ def _build_model_client(args):
     # 真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
     if provider == "openai":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or os.environ.get("OPENAI_API_BASE") or DEFAULT_OPENAI_BASE_URL
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+        base_url = getattr(args, "base_url", None) or _env_get("OPENAI_API_BASE") or DEFAULT_OPENAI_BASE_URL
+        api_key = _env_get("OPENAI_API_KEY", "")
         return OpenAICompatibleModelClient(
             model=model,
             base_url=base_url,
@@ -527,7 +584,7 @@ def _build_model_client(args):
         )
     if provider == "anthropic":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or os.environ.get("ANTHROPIC_API_BASE") or DEFAULT_ANTHROPIC_BASE_URL
+        base_url = getattr(args, "base_url", None) or _env_get("ANTHROPIC_API_BASE") or DEFAULT_ANTHROPIC_BASE_URL
         api_key = _first_env("ANTHROPIC_API_KEY", "RIGHT_CODES_API_KEY", "OPENAI_API_KEY")
         return AnthropicCompatibleModelClient(
             model=model,
@@ -535,6 +592,24 @@ def _build_model_client(args):
             api_key=api_key,
             temperature=args.temperature,
             timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
+        )
+    if provider == "deepseek":
+        model = _effective_model(args, provider)
+        base_url = getattr(args, "base_url", None) or _env_get("DEEPSEEK_API_BASE") or DEFAULT_DEEPSEEK_BASE_URL
+        api_key = _env_get("DEEPSEEK_API_KEY", "")
+        thinking = getattr(args, "deepseek_thinking", None) or _env_get("DEEPSEEK_THINKING", "enabled")
+        reasoning_effort = (
+            getattr(args, "deepseek_reasoning_effort", None)
+            or _env_get("DEEPSEEK_REASONING_EFFORT", "high")
+        )
+        return DeepSeekModelClient(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            temperature=args.temperature,
+            timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
         )
 
     model = _effective_model(args, provider)
@@ -612,8 +687,9 @@ def build_agent(args):
     # 这里是 CLI 到 runtime 的装配点：
     # 先整理 secret 名单，再采集工作区快照，随后决定是恢复旧 session
     # 还是创建一个新的 RepoFox 实例。
-    configured_secret_names = _configured_secret_names(args)
     workspace = WorkspaceContext.build(args.cwd)
+    _load_dotenv_files(workspace.repo_root)
+    configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.repofox/sessions")
     model = _build_model_client(args)
     session_id = args.resume
@@ -644,20 +720,32 @@ def build_agent(args):
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="RepoFox local coding agent for Ollama, OpenAI-compatible, or Anthropic-compatible models.",
+        description="RepoFox local coding agent for Ollama, OpenAI-compatible, DeepSeek, or Anthropic-compatible models.",
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
-    parser.add_argument("--provider", choices=("ollama", "openai", "anthropic"), default="openai", help="Model backend to use.")
+    parser.add_argument("--provider", choices=("ollama", "openai", "deepseek", "anthropic"), default="openai", help="Model backend to use.")
     parser.add_argument(
         "--model",
         default=None,
-        help="Model name override. Defaults to qwen3.5:4b for Ollama, OPENAI_MODEL for openai, and ANTHROPIC_MODEL for anthropic when set.",
+        help="Model name override. Defaults to qwen3.5:4b for Ollama, OPENAI_MODEL for openai, DEEPSEEK_MODEL for deepseek, and ANTHROPIC_MODEL for anthropic when set.",
     )
     parser.add_argument("--host", default=DEFAULT_OLLAMA_HOST, help="Ollama server URL.")
-    parser.add_argument("--base-url", default=None, help="Provider API base URL for openai or anthropic.")
+    parser.add_argument("--base-url", default=None, help="Provider API base URL for openai, deepseek, or anthropic.")
     parser.add_argument("--ollama-timeout", type=int, default=300, help="Ollama request timeout in seconds.")
     parser.add_argument("--openai-timeout", type=int, default=300, help="OpenAI-compatible request timeout in seconds.")
+    parser.add_argument(
+        "--deepseek-thinking",
+        choices=("enabled", "disabled"),
+        default=None,
+        help="DeepSeek thinking mode. Falls back to DEEPSEEK_THINKING or enabled.",
+    )
+    parser.add_argument(
+        "--deepseek-reasoning-effort",
+        choices=("high", "max"),
+        default=None,
+        help="DeepSeek reasoning effort. Falls back to DEEPSEEK_REASONING_EFFORT or high.",
+    )
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
     parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask", help="Approval policy for risky tools.")
     parser.add_argument(

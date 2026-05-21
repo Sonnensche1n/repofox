@@ -56,6 +56,12 @@ pip install -e .
 
 ## 快速开始
 
+RepoFox 会在工作区根目录自动加载 `.env` 和 `.env.local`。如果同一个键同时出现在多个地方，优先级是：
+
+- 已显式导出的系统环境变量
+- `.env.local`
+- `.env`
+
 在当前仓库里启动交互模式：
 
 ```bash
@@ -127,18 +133,35 @@ uv run repofox --provider ollama --model qwen3.5:4b
 ### OpenAI 兼容接口
 
 ```bash
-export OPENAI_API_BASE="https://your-api.example/v1"
-export OPENAI_API_KEY="your-api-key"
-export OPENAI_MODEL="gpt-5.4"
+cat > .env <<'EOF'
+OPENAI_API_BASE=https://your-api.example/v1
+OPENAI_API_KEY=your-api-key
+OPENAI_MODEL=gpt-5.4
+EOF
 uv run repofox --provider openai
+```
+
+### DeepSeek
+
+```bash
+cat > .env <<'EOF'
+DEEPSEEK_API_BASE=https://api.deepseek.com
+DEEPSEEK_API_KEY=your-api-key
+DEEPSEEK_MODEL=deepseek-v4-pro
+DEEPSEEK_THINKING=disabled
+DEEPSEEK_REASONING_EFFORT=high
+EOF
+uv run repofox --provider deepseek
 ```
 
 ### Anthropic 兼容接口
 
 ```bash
-export ANTHROPIC_API_BASE="https://www.right.codes/claude/v1"
-export ANTHROPIC_API_KEY="your-api-key"
-export ANTHROPIC_MODEL="claude-sonnet-4-6"
+cat > .env <<'EOF'
+ANTHROPIC_API_BASE=https://www.right.codes/claude/v1
+ANTHROPIC_API_KEY=your-api-key
+ANTHROPIC_MODEL=claude-sonnet-4-6
+EOF
 uv run repofox --provider anthropic
 ```
 
