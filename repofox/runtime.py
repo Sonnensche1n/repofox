@@ -66,10 +66,26 @@ class PromptPrefix:
 class FinalAnswerStream:
     """过滤模型原始流式片段，只把用户可见的最终答案往外推。"""
 
+    OPEN_TAG = "<final>"
+    CLOSE_TAG = "</final>"
+
     def __init__(self, callback):
         self.callback = callback
         self.buffer = ""
         self.emitted_chars = 0
+
+    @classmethod
+    def trim_partial_tag_suffix(cls, text, tags=None):
+        text = str(text)
+        tags = tags or (cls.OPEN_TAG, cls.CLOSE_TAG)
+        trim = 0
+        for tag in tags:
+            for size in range(1, len(tag)):
+                if text.endswith(tag[:size]):
+                    trim = max(trim, size)
+        if trim:
+            return text[:-trim]
+        return text
 
     def feed(self, chunk):
         if not chunk:
@@ -84,16 +100,16 @@ class FinalAnswerStream:
     def visible_text(self):
         # 工具调用是 runtime 内部控制消息，不能直接暴露给 CLI/SSE。
         # 等模型进入 <final> 后，再把最终答案内容流式推给用户侧。
-        if "<final>" in self.buffer:
-            body = self.buffer.split("<final>", 1)[1]
-            if "</final>" in body:
-                return body.split("</final>", 1)[0]
-            return body
-        if "</final>" in self.buffer:
-            return self.buffer.split("</final>", 1)[0]
+        if self.OPEN_TAG in self.buffer:
+            body = self.buffer.split(self.OPEN_TAG, 1)[1]
+            if self.CLOSE_TAG in body:
+                return body.split(self.CLOSE_TAG, 1)[0]
+            return self.trim_partial_tag_suffix(body, tags=(self.CLOSE_TAG,))
+        if self.CLOSE_TAG in self.buffer:
+            return self.buffer.split(self.CLOSE_TAG, 1)[0]
         stripped = self.buffer.lstrip()
         if stripped and not stripped.startswith("<"):
-            return self.buffer
+            return self.trim_partial_tag_suffix(self.buffer)
         return ""
 
 
@@ -1322,6 +1338,9 @@ class RepoFox:
                 return "final", final
             return "retry", RepoFox.retry_notice("model returned an empty <final> answer")
         raw = raw.strip()
+        if "</final>" in raw:
+            raw = raw.split("</final>", 1)[0].rstrip()
+        raw = FinalAnswerStream.trim_partial_tag_suffix(raw, tags=(FinalAnswerStream.OPEN_TAG, FinalAnswerStream.CLOSE_TAG)).rstrip()
         if raw:
             return "final", raw
         return "retry", RepoFox.retry_notice("model returned an empty response")
